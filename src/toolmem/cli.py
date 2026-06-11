@@ -37,8 +37,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--offline", action="store_true")
     run.add_argument(
         "--model-provider",
-        choices=["openrouter", "openai-compatible", "fake"],
-        default="fake",
+        choices=["openrouter", "openai-compatible", "smoke-test"],
+        default="smoke-test",
     )
     run.add_argument("--endpoint", default="")
     run.add_argument("--model", default=os.getenv("OPENAI_MODEL", ""))
@@ -68,7 +68,7 @@ def suite_from_args(path: str | None) -> list[BenchmarkTask]:
     return load_suite(path) if path else starter_suite()
 
 
-def fake_model_for(task: BenchmarkTask) -> DeterministicFakeModel:
+def smoke_test_model_for(task: BenchmarkTask) -> DeterministicFakeModel:
     # This is a harness smoke-test adapter, not a benchmark baseline.
     expected = task.grader.get("expected")
     answer = json.dumps(expected) if isinstance(expected, (dict, list, bool)) else str(expected)
@@ -120,7 +120,7 @@ async def run_command(args: argparse.Namespace) -> int:
     all_results = []
     for repetition in range(args.repetitions):
         run_root = Path(args.output) / f"run-{repetition + 1}"
-        if args.model_provider != "fake":
+        if args.model_provider != "smoke-test":
             model = make_model(args)
             harness = BenchmarkHarness(
                 model,
@@ -135,11 +135,11 @@ async def run_command(args: argparse.Namespace) -> int:
             harness.close()
         else:
             results = []
-            # A fresh scripted fake is created per task so smoke tests remain deterministic.
+            # A fresh scripted model is created per task so smoke tests remain deterministic.
             for index, task in enumerate(tasks, 1):
                 show_progress(index, len(tasks), task.task_id)
                 harness = BenchmarkHarness(
-                    fake_model_for(task),
+                    smoke_test_model_for(task),
                     run_root,
                     executor=make_executor(args.executor, args.offline),
                     persistent=args.memory == "persistent",
@@ -257,7 +257,7 @@ def interactive_args() -> argparse.Namespace | None:
         [
             ("openrouter", "OpenRouter"),
             ("openai-compatible", "OpenAI-compatible endpoint"),
-            ("fake", "Deterministic smoke-test model"),
+            ("smoke-test", "Deterministic harness smoke test — not a model baseline"),
         ],
     )
     model = ""
@@ -375,7 +375,9 @@ def main() -> int:
         return compare_retrieval(args)
     if args.command == "memory":
         registry = ToolRegistry(args.registry)
-        print(json.dumps(registry.metrics(), indent=2))
+        metrics = registry.metrics()
+        metrics.update(registry.near_duplicate_stats())
+        print(json.dumps(metrics, indent=2))
         registry.close()
         return 0
     return 2

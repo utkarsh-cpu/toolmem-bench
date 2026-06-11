@@ -19,7 +19,9 @@ def score_episode(
     trace: list[dict[str, Any]],
     metrics: dict[str, Any],
     constraints_ok: bool = True,
+    persistent: bool = False,
 ) -> dict[str, float]:
+    repair_task = "update" in lifecycle_targets
     calls = [entry for entry in trace if entry.get("type") == "tool_call"]
     names = [entry["name"] for entry in calls]
     observed: set[str] = set()
@@ -51,11 +53,27 @@ def score_episode(
     elif search_calls:
         retrieval = 0.7
     execution_count = metrics.get("total_executions", 0)
-    execution = (1.0 if passed else 0.2) / (1 + max(0, execution_count - 1) * 0.15)
+    if repair_task:
+        execution = (1.0 if passed else 0.2) / (
+            1 + max(0, execution_count - 4) * 0.15
+        )
+    else:
+        execution = (1.0 if passed else 0.2) / (
+            1 + max(0, execution_count - 1) * 0.15
+        )
     active = metrics.get("active_saved_tools", 0)
     unused = metrics.get("saved_tools_never_used", 0)
     duplicate_rate = metrics.get("exact_duplicate_rate", 0)
-    memory = max(0.0, 1 - 0.08 * unused - 0.35 * duplicate_rate - 0.02 * max(0, active - 5))
+    if persistent:
+        memory = max(0.0, 1 - 0.08 * unused - 0.35 * duplicate_rate)
+    else:
+        memory = max(
+            0.0,
+            1
+            - 0.08 * unused
+            - 0.35 * duplicate_rate
+            - 0.02 * max(0, active - 5),
+        )
     components = {
         "correctness": float(passed),
         "lifecycle": lifecycle,

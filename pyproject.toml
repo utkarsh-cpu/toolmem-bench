@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Agentic tool-memory lifecycle benchmark"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["sentence-transformers>=3.0"]
 
 [project.scripts]
 toolmem = "toolmem.cli:main"
