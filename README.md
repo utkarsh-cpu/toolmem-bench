@@ -18,12 +18,12 @@ Python 3.11 or later is required. Docker is recommended for untrusted model outp
 uv sync
 uv run toolmem
 uv run toolmem list-tasks
-uv run toolmem run --task no-tool-needed --executor local
+uv run toolmem run --task no-tool-needed --executor local --model-provider smoke-test
 ```
 
 Running `toolmem` without a command opens a guided terminal interface.
 
-The `fake` provider is a deterministic harness smoke test and directly returns the
+The `smoke-test` provider is a deterministic harness smoke test and directly returns the
 known expected answer. It is not a model baseline. To run a real model:
 
 ```bash
@@ -97,7 +97,7 @@ the exactly-three-tools constraint.
 The registry supports:
 
 - SQLite FTS5 lexical search.
-- Deterministic local semantic vectors with no external embedding dependency.
+- Sentence-transformers semantic embeddings using `all-MiniLM-L6-v2`.
 - Hybrid reranking using lexical relevance, semantic similarity, schema compatibility,
   execution reliability, and latency.
 

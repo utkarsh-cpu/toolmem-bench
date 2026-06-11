@@ -12,7 +12,7 @@ from typing import Any
 from .api import ToolMemoryAPI
 from .executor import DockerExecutor, LocalExecutor, ToolExecutor
 from .models import ModelAdapter
-from .registry import ToolRegistry
+from .registry import ToolRegistry, source_hash
 from .scoring import score_episode
 from .tasks import BenchmarkTask, grade_answer
 from .types import EpisodeResult
@@ -61,7 +61,8 @@ class BenchmarkHarness:
                 shutil.rmtree(task_root)
             registry = ToolRegistry(task_root)
         for spec in task.seeded_tools:
-            registry.save(spec)
+            if not registry.has_tool(spec.name, source_hash(spec.source)):
+                registry.save(spec)
         return registry
 
     async def run_task(self, task: BenchmarkTask) -> EpisodeResult:
@@ -138,13 +139,18 @@ class BenchmarkHarness:
                 continue
             final_answer = response.final_answer if response.final_answer is not None else response.content
             break
-        passed = grade_answer(final_answer, task.grader)
+        passed = grade_answer(
+            final_answer,
+            task.grader,
+            context=api.registry.metrics(),
+        )
         metrics = {
             **api.metrics(),
             "turns": len([entry for entry in trace if entry["type"] == "model"]),
             "wall_time_ms": (time.monotonic() - started) * 1000,
             "token_usage": total_usage,
         }
+        metrics.update(registry.near_duplicate_stats())
         metrics["tool_calls_per_successful_task"] = (
             metrics["meta_tool_calls"] if passed else None
         )
@@ -154,7 +160,14 @@ class BenchmarkHarness:
         metrics["repair_success"] = (
             passed if "update" in task.lifecycle_targets else None
         )
-        score = score_episode(passed, task.lifecycle_targets, trace, metrics, constraints_ok)
+        score = score_episode(
+            passed,
+            task.lifecycle_targets,
+            trace,
+            metrics,
+            constraints_ok,
+            persistent=self.persistent,
+        )
         result = EpisodeResult(task.task_id, final_answer, passed, score, metrics, trace)
         if not self.persistent:
             registry.close()

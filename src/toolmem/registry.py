@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import sqlite3
 import uuid
-from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,7 +12,8 @@ from typing import Any
 from .types import ExecutionResult, Runtime, SearchResult, ToolSpec, ToolState, ToolVersion
 
 TOKEN_RE = re.compile(r"[a-z0-9_]+")
-VECTOR_SIZE = 128
+VECTOR_SIZE = 384
+_EMBEDDING_MODEL: Any | None = None
 
 
 def utcnow() -> str:
@@ -26,14 +25,12 @@ def source_hash(source: str) -> str:
 
 
 def embed(text: str) -> list[float]:
-    vector = [0.0] * VECTOR_SIZE
-    for token, count in Counter(TOKEN_RE.findall(text.lower())).items():
-        digest = hashlib.blake2b(token.encode(), digest_size=8).digest()
-        index = int.from_bytes(digest, "big") % VECTOR_SIZE
-        sign = 1 if digest[0] & 1 else -1
-        vector[index] += sign * (1 + math.log(count))
-    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
-    return [value / norm for value in vector]
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+
+        _EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    return _EMBEDDING_MODEL.encode(text, normalize_embeddings=True).tolist()
 
 
 def cosine(left: list[float], right: list[float]) -> float:
@@ -110,6 +107,12 @@ class ToolRegistry:
             """
         )
         self.connection.commit()
+        version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
+            # Version 1 establishes the schema baseline. Existing 128-dimensional
+            # embeddings are not rewritten and remain stale until tools are re-saved.
+            self.connection.execute("PRAGMA user_version = 1")
+            self.connection.commit()
 
     def _write_artifact(self, digest: str, source: str) -> None:
         path = self.artifacts / digest
@@ -124,11 +127,19 @@ class ToolRegistry:
             (kind, tool_id, version, json.dumps(data, sort_keys=True), utcnow()),
         )
 
-    def save(self, spec: ToolSpec, tool_id: str | None = None, restored_from: int | None = None) -> ToolVersion:
+    def save(
+        self,
+        spec: ToolSpec,
+        tool_id: str | None = None,
+        restored_from: int | None = None,
+        allow_reactivate: bool = False,
+    ) -> ToolVersion:
         tool_id = tool_id or str(uuid.uuid4())
         row = self.connection.execute(
             "SELECT current_version, state FROM tools WHERE tool_id = ?", (tool_id,)
         ).fetchone()
+        if row and row["state"] == "deleted" and not allow_reactivate:
+            raise KeyError(f"cannot update deleted tool: {tool_id}")
         version = int(row["current_version"]) + 1 if row else 1
         digest = source_hash(spec.source)
         self._write_artifact(digest, spec.source)
@@ -176,6 +187,16 @@ class ToolRegistry:
         self._event("save", tool_id, version, {"source_hash": digest})
         self.connection.commit()
         return self.get(tool_id, version)
+
+    def has_tool(self, name: str, source_hash: str) -> bool:
+        row = self.connection.execute(
+            """SELECT 1 FROM tools t JOIN versions v
+               ON v.tool_id = t.tool_id AND v.version = t.current_version
+               WHERE t.state = 'active' AND t.name = ? AND v.source_hash = ?
+               LIMIT 1""",
+            (name, source_hash),
+        ).fetchone()
+        return row is not None
 
     def get(self, tool_id: str, version: int | None = None, include_deleted: bool = False) -> ToolVersion:
         tool = self.connection.execute(
@@ -249,7 +270,12 @@ class ToolRegistry:
 
     def restore(self, tool_id: str, version: int) -> ToolVersion:
         original = self.get(tool_id, version, include_deleted=True)
-        return self.save(original.spec, tool_id=tool_id, restored_from=version)
+        return self.save(
+            original.spec,
+            tool_id=tool_id,
+            restored_from=version,
+            allow_reactivate=True,
+        )
 
     def record_execution(
         self,
@@ -302,25 +328,30 @@ class ToolRegistry:
         ).fetchall()
         lexical: dict[tuple[str, int], float] = {}
         if query.strip():
-            fts_query = " OR ".join(TOKEN_RE.findall(query.lower())) or '""'
-            try:
-                hits = self.connection.execute(
-                    """
-                    SELECT tool_id, CAST(version AS INTEGER) version, bm25(versions_fts) rank
-                    FROM versions_fts WHERE versions_fts MATCH ?
-                    """,
-                    (fts_query,),
-                ).fetchall()
-                if hits:
-                    best = min(float(hit["rank"]) for hit in hits)
-                    worst = max(float(hit["rank"]) for hit in hits)
-                    span = worst - best or 1.0
-                    lexical = {
-                        (hit["tool_id"], int(hit["version"])): 1 - (float(hit["rank"]) - best) / span
-                        for hit in hits
-                    }
-            except sqlite3.OperationalError:
+            tokens = TOKEN_RE.findall(query.lower())
+            if not tokens:
                 lexical = {}
+            else:
+                fts_query = " OR ".join(tokens)
+                try:
+                    hits = self.connection.execute(
+                        """
+                        SELECT tool_id, CAST(version AS INTEGER) version, bm25(versions_fts) rank
+                        FROM versions_fts WHERE versions_fts MATCH ?
+                        """,
+                        (fts_query,),
+                    ).fetchall()
+                    if hits:
+                        best = min(float(hit["rank"]) for hit in hits)
+                        worst = max(float(hit["rank"]) for hit in hits)
+                        span = worst - best or 1.0
+                        lexical = {
+                            (hit["tool_id"], int(hit["version"])): 1
+                            - (float(hit["rank"]) - best) / span
+                            for hit in hits
+                        }
+                except sqlite3.OperationalError:
+                    lexical = {}
         query_vector = embed(query)
         requested_keys = set((input_schema or {}).get("properties", {}))
         results: list[SearchResult] = []
@@ -332,7 +363,12 @@ class ToolRegistry:
                 continue
             key = (row["tool_id"], int(row["version"]))
             lex = lexical.get(key, 0.0)
-            sem = max(0.0, cosine(query_vector, json.loads(row["embedding"])))
+            stored_vector = json.loads(row["embedding"])
+            sem = (
+                max(0.0, cosine(query_vector, stored_vector))
+                if len(query_vector) == len(stored_vector)
+                else 0.0
+            )
             stats = self.connection.execute(
                 """
                 SELECT COUNT(*) count,
@@ -464,19 +500,6 @@ class ToolRegistry:
             FROM executions
             """
         ).fetchone()
-        version_rows = self.connection.execute(
-            "SELECT tool_id, version, source_hash, embedding FROM versions"
-        ).fetchall()
-        near_duplicate_pairs = 0
-        comparable_pairs = 0
-        for index, left in enumerate(version_rows):
-            left_vector = json.loads(left["embedding"])
-            for right in version_rows[index + 1 :]:
-                comparable_pairs += 1
-                if left["source_hash"] != right["source_hash"] and cosine(
-                    left_vector, json.loads(right["embedding"])
-                ) >= 0.92:
-                    near_duplicate_pairs += 1
         db_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
         embedding_bytes = self.connection.execute(
             "SELECT COALESCE(SUM(LENGTH(embedding)), 0) bytes FROM versions"
@@ -513,12 +536,35 @@ class ToolRegistry:
                 if successful_reused_executions
                 else None
             ),
-            "near_duplicate_pairs": near_duplicate_pairs,
-            "near_duplicate_rate": (
-                near_duplicate_pairs / comparable_pairs if comparable_pairs else 0
-            ),
+            # Call near_duplicate_stats() explicitly when pairwise metrics are needed.
+            "near_duplicate_pairs": 0,
+            "near_duplicate_rate": 0,
             "average_execution_duration_ms": float(execution_stats["avg_ms"] or 0),
             "average_cpu_seconds": float(execution_stats["avg_cpu"] or 0),
             "peak_rss_bytes": int(execution_stats["max_rss"] or 0),
             "versions_per_tool": versions / (active + deleted) if active + deleted else 0,
+        }
+
+    def near_duplicate_stats(self) -> dict[str, Any]:
+        version_rows = self.connection.execute(
+            "SELECT tool_id, version, source_hash, embedding FROM versions"
+        ).fetchall()
+        near_duplicate_pairs = 0
+        comparable_pairs = 0
+        for index, left in enumerate(version_rows):
+            left_vector = json.loads(left["embedding"])
+            for right in version_rows[index + 1 :]:
+                comparable_pairs += 1
+                right_vector = json.loads(right["embedding"])
+                if (
+                    left["source_hash"] != right["source_hash"]
+                    and len(left_vector) == len(right_vector)
+                    and cosine(left_vector, right_vector) >= 0.92
+                ):
+                    near_duplicate_pairs += 1
+        return {
+            "near_duplicate_pairs": near_duplicate_pairs,
+            "near_duplicate_rate": (
+                near_duplicate_pairs / comparable_pairs if comparable_pairs else 0
+            ),
         }

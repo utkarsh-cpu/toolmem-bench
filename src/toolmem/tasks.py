@@ -18,11 +18,23 @@ class BenchmarkTask:
     tags: list[str] = field(default_factory=list)
 
 
-def grade_answer(answer: Any, grader: dict[str, Any]) -> bool:
+def grade_answer(
+    answer: Any,
+    grader: dict[str, Any],
+    context: dict[str, Any] | None = None,
+) -> bool:
     kind = grader["type"]
     expected = grader.get("expected")
     if kind == "exact":
         return answer == expected
+    if kind == "exact_with_registry":
+        text_ok = answer == expected
+        if not text_ok:
+            return False
+        if context:
+            duplicate_rate = context.get("exact_duplicate_rate", 1.0)
+            return duplicate_rate == 0.0
+        return True
     if kind == "json":
         try:
             actual = json.loads(answer) if isinstance(answer, str) else answer
@@ -89,7 +101,7 @@ def starter_suite() -> list[BenchmarkTask]:
         ("version-choice", "Use the most reliable current saved summation tool for [10,20,30].", ["find"], "number", 60),
         ("no-tool-needed", "Answer directly: what is 2 + 2?", [], "number", 4),
         ("one-off-transform", "For this one-off task, reverse the list [1,2,3] without polluting persistent memory.", ["ephemeral"], "json", [3, 2, 1]),
-        ("delete-duplicate", "Remove an obsolete duplicate tool if present, then return 'clean'.", ["delete"], "exact", "clean"),
+        ("delete-duplicate", "Remove an obsolete duplicate tool if present, then return 'clean'.", ["delete"], "exact_with_registry", "clean"),
         ("reusable-slug", "Create a reusable slugification tool and slugify 'Agentic Tool Memory'.", ["create", "save"], "exact", "agentic-tool-memory"),
         ("multi-step", "Normalize [3,1,3,2], remove duplicates, sort, and return their sum.", ["create", "run"], "number", 6),
         ("schema-retrieval", "Find a tool accepting a numbers array and use it for [1,1,2,3,5,8].", ["find", "schema"], "number", 20),
